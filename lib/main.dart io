@@ -1,0 +1,1117 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const SubTrimmerApp());
+}
+
+class SubTrimmerApp extends StatelessWidget {
+  const SubTrimmerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Subscription & Bill Trimmer',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF6C5CE7),
+          brightness: Brightness.light,
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF5F6FA),
+        fontFamily: 'Roboto',
+      ),
+      home: const DashboardScreen(),
+    );
+  }
+}
+
+// ---------------- MODEL ----------------
+enum BillingCycle { monthly, yearly }
+
+extension BillingCycleLabel on BillingCycle {
+  String get label => this == BillingCycle.monthly ? 'মাসিক' : 'বার্ষিক';
+}
+
+class Subscription {
+  final String name;
+  final double cost;
+  final DateTime renewalDate;
+  final IconData icon;
+  final Color color;
+  final BillingCycle billingCycle;
+  DateTime lastUsedDate;
+
+  Subscription({
+    required this.name,
+    required this.cost,
+    required this.renewalDate,
+    required this.icon,
+    required this.color,
+    this.billingCycle = BillingCycle.monthly,
+    DateTime? lastUsedDate,
+  }) : lastUsedDate = lastUsedDate ?? DateTime.now();
+
+  // মাসিক হিসেবে খরচ (বার্ষিক হলে ভাগ করে দেখানো হয়)
+  double get monthlyEquivalentCost =>
+      billingCycle == BillingCycle.yearly ? cost / 12 : cost;
+
+  // বার্ষিক হিসেবে খরচ (মাসিক হলে গুণ করে দেখানো হয়)
+  double get yearlyEquivalentCost =>
+      billingCycle == BillingCycle.yearly ? cost : cost * 12;
+
+  int get daysSinceLastUsed => DateTime.now().difference(lastUsedDate).inDays;
+
+  // গত ৩০ দিনে ব্যবহার না হলে "অপ্রয়োজনীয়" হিসেবে চিহ্নিত হবে
+  bool get isUnused => daysSinceLastUsed > 30;
+
+  // ---------- লোকাল স্টোরেজের জন্য JSON কনভার্শন ----------
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'cost': cost,
+        'renewalDate': renewalDate.toIso8601String(),
+        'iconCodePoint': icon.codePoint,
+        'iconFontFamily': icon.fontFamily,
+        'colorValue': color.value,
+        'billingCycle': billingCycle.name,
+        'lastUsedDate': lastUsedDate.toIso8601String(),
+      };
+
+  factory Subscription.fromJson(Map<String, dynamic> json) {
+    return Subscription(
+      name: json['name'] as String,
+      cost: (json['cost'] as num).toDouble(),
+      renewalDate: DateTime.parse(json['renewalDate'] as String),
+      icon: IconData(
+        json['iconCodePoint'] as int,
+        fontFamily: json['iconFontFamily'] as String?,
+      ),
+      color: Color(json['colorValue'] as int),
+      billingCycle: BillingCycle.values.firstWhere(
+        (e) => e.name == json['billingCycle'],
+        orElse: () => BillingCycle.monthly,
+      ),
+      lastUsedDate: DateTime.parse(json['lastUsedDate'] as String),
+    );
+  }
+}
+
+// ---------------- DASHBOARD ----------------
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  static const String _storageKey = 'subscriptions_data';
+
+  List<Subscription> _subscriptions = [];
+  bool _isLoading = true;
+  late SharedPreferences _prefs;
+
+  // অ্যাপ প্রথমবার ওপেন হলে (কোনো সেভড ডেটা না থাকলে) এই ডেমো লিস্ট দেখানো হবে
+  List<Subscription> _defaultSubscriptions() => [
+        Subscription(
+          name: 'Netflix',
+          cost: 650,
+          renewalDate: DateTime(2026, 10, 5),
+          icon: Icons.smart_display_rounded,
+          color: const Color(0xFFE50914),
+          lastUsedDate: DateTime.now().subtract(const Duration(days: 2)),
+        ),
+        Subscription(
+          name: 'Spotify',
+          cost: 199,
+          renewalDate: DateTime(2026, 10, 12),
+          icon: Icons.music_note_rounded,
+          color: const Color(0xFF1DB954),
+          lastUsedDate: DateTime.now().subtract(const Duration(days: 45)),
+        ),
+        Subscription(
+          name: 'Internet Bill',
+          cost: 1200,
+          renewalDate: DateTime(2026, 10, 3),
+          icon: Icons.wifi_rounded,
+          color: const Color(0xFF0984E3),
+          lastUsedDate: DateTime.now().subtract(const Duration(days: 1)),
+        ),
+        Subscription(
+          name: 'YouTube Premium',
+          cost: 349,
+          renewalDate: DateTime(2026, 10, 18),
+          icon: Icons.play_circle_fill_rounded,
+          color: const Color(0xFFFF0000),
+          lastUsedDate: DateTime.now().subtract(const Duration(days: 60)),
+        ),
+        Subscription(
+          name: 'Amazon Prime',
+          cost: 1500,
+          renewalDate: DateTime(2027, 3, 10),
+          icon: Icons.shopping_bag_rounded,
+          color: const Color(0xFF00A8E1),
+          billingCycle: BillingCycle.yearly,
+          lastUsedDate: DateTime.now().subtract(const Duration(days: 5)),
+        ),
+      ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSubscriptions();
+  }
+
+  // ---------- লোকাল স্টোরেজ থেকে ডেটা লোড করা ----------
+  Future<void> _loadSubscriptions() async {
+    _prefs = await SharedPreferences.getInstance();
+    final String? savedData = _prefs.getString(_storageKey);
+
+    List<Subscription> loaded;
+    if (savedData == null || savedData.isEmpty) {
+      // প্রথমবার অ্যাপ চালু হলে ডেমো ডেটা দেখানো হবে
+      loaded = _defaultSubscriptions();
+    } else {
+      try {
+        final List<dynamic> decoded = jsonDecode(savedData);
+        loaded = decoded
+            .map((item) => Subscription.fromJson(item as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        // ডেটা করাপ্টেড হলে ডেমো ডেটায় ফিরে যাওয়া
+        loaded = _defaultSubscriptions();
+      }
+    }
+
+    setState(() {
+      _subscriptions = loaded;
+      _isLoading = false;
+    });
+  }
+
+  // ---------- লোকাল স্টোরেজে ডেটা সেভ করা ----------
+  Future<void> _saveSubscriptions() async {
+    final String encoded =
+        jsonEncode(_subscriptions.map((s) => s.toJson()).toList());
+    await _prefs.setString(_storageKey, encoded);
+  }
+
+  // বার্ষিক সাবস্ক্রিপশনকে মাসিক হিসেবে ভেঙে মোট বের করা হয়
+  double get _totalMonthlyCost => _subscriptions.fold(
+      0, (sum, item) => sum + item.monthlyEquivalentCost);
+
+  double get _totalYearlyCost => _totalMonthlyCost * 12;
+
+  List<Subscription> get _unusedSubscriptions =>
+      _subscriptions.where((s) => s.isUnused).toList();
+
+  void _addSubscription(Subscription sub) {
+    setState(() {
+      _subscriptions.add(sub);
+    });
+    _saveSubscriptions();
+  }
+
+  void _deleteSubscription(int index) {
+    setState(() {
+      _subscriptions.removeAt(index);
+    });
+    _saveSubscriptions();
+  }
+
+  void _cancelSubscription(Subscription sub) {
+    setState(() {
+      _subscriptions.remove(sub);
+    });
+    _saveSubscriptions();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('${sub.name} বাতিল করা হয়েছে')),
+    );
+  }
+
+  void _markAsUsed(Subscription sub) {
+    setState(() {
+      sub.lastUsedDate = DateTime.now();
+    });
+    _saveSubscriptions();
+  }
+
+  void _openAddSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => AddSubscriptionSheet(onAdd: _addSubscription),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFF6C5CE7)),
+        ),
+      );
+    }
+    return Scaffold(
+      body: SafeArea(
+        child: CustomScrollView(
+          slivers: [
+            SliverToBoxAdapter(child: _buildHeader()),
+            SliverToBoxAdapter(child: _buildSummaryCard()),
+            SliverToBoxAdapter(child: _buildAnalyticsSection()),
+            if (_unusedSubscriptions.isNotEmpty)
+              SliverToBoxAdapter(child: _buildSmartTipsSection()),
+            SliverToBoxAdapter(child: _buildSectionTitle()),
+            _subscriptions.isEmpty
+                ? SliverToBoxAdapter(child: _buildEmptyState())
+                : SliverList(
+                    delegate: SliverChildBuilderDelegate(
+                      (context, index) => Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+                        child: _buildSubscriptionTile(index),
+                      ),
+                      childCount: _subscriptions.length,
+                    ),
+                  ),
+            const SliverToBoxAdapter(child: SizedBox(height: 90)),
+          ],
+        ),
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _openAddSheet,
+        backgroundColor: const Color(0xFF6C5CE7),
+        icon: const Icon(Icons.add_rounded, color: Colors.white),
+        label: const Text(
+          'নতুন সাবস্ক্রিপশন',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'স্বাগতম 👋',
+                style: TextStyle(fontSize: 14, color: Colors.grey),
+              ),
+              Text(
+                'আপনার সাবস্ক্রিপশন',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          CircleAvatar(
+            radius: 22,
+            backgroundColor: const Color(0xFF6C5CE7).withOpacity(0.15),
+            child: const Icon(Icons.person_rounded, color: Color(0xFF6C5CE7)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSummaryCard() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFF6C5CE7), Color(0xFF8E7CFF)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: BorderRadius.circular(24),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF6C5CE7).withOpacity(0.35),
+              blurRadius: 20,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'এই মাসের মোট খরচ',
+                  style: TextStyle(color: Colors.white70, fontSize: 14),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '${_subscriptions.length} টি একটিভ',
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '৳ ${_totalMonthlyCost.toStringAsFixed(0)}',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 36,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'প্রতি মাসে',
+              style: TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                const Icon(Icons.info_outline_rounded,
+                    color: Colors.white70, size: 16),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _nextRenewalText(),
+                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _nextRenewalText() {
+    if (_subscriptions.isEmpty) return 'কোনো সক্রিয় সাবস্ক্রিপশন নেই';
+    final sorted = List<Subscription>.from(_subscriptions)
+      ..sort((a, b) => a.renewalDate.compareTo(b.renewalDate));
+    final next = sorted.first;
+    return 'পরবর্তী রিনিউয়াল: ${next.name} — ${_formatDate(next.renewalDate)}';
+  }
+
+  Widget _buildAnalyticsSection() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: _analyticsMiniCard(
+              title: 'মাসিক টোটাল',
+              value: '৳${_totalMonthlyCost.toStringAsFixed(0)}',
+              icon: Icons.calendar_view_month_rounded,
+              color: const Color(0xFF6C5CE7),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: _analyticsMiniCard(
+              title: 'বার্ষিক টোটাল',
+              value: '৳${_totalYearlyCost.toStringAsFixed(0)}',
+              icon: Icons.event_repeat_rounded,
+              color: const Color(0xFF00B894),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _analyticsMiniCard({
+    required String title,
+    required String value,
+    required IconData icon,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, color: color, size: 18),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            title,
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSmartTipsSection() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 22, 20, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.lightbulb_rounded,
+                  color: Color(0xFFFDCB6E), size: 20),
+              const SizedBox(width: 6),
+              const Text(
+                'Smart Tip',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'গত ৩০ দিনে ব্যবহার হয়নি এমন সাবস্ক্রিপশন পাওয়া গেছে',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 12),
+          ..._unusedSubscriptions.map((sub) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _buildTipCard(sub),
+              )),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTipCard(Subscription sub) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF3E0),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFFFCC80)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: sub.color.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(sub.icon, color: sub.color, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      sub.name,
+                      style: const TextStyle(
+                          fontSize: 14, fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${sub.daysSinceLastUsed} দিন ধরে ব্যবহার হয়নি — মাসে ৳${sub.monthlyEquivalentCost.toStringAsFixed(0)} খরচ হচ্ছে',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: Colors.brown.shade600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => _markAsUsed(sub),
+                  icon: const Icon(Icons.check_circle_outline_rounded,
+                      size: 16),
+                  label: const Text('ব্যবহার করেছি'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF00B894),
+                    side: const BorderSide(color: Color(0xFF00B894)),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: () => _confirmCancel(sub),
+                  icon: const Icon(Icons.cancel_rounded, size: 16),
+                  label: const Text('বাতিল করুন'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFE17055),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmCancel(Subscription sub) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18),
+        ),
+        title: Text('${sub.name} বাতিল করবেন?'),
+        content: const Text(
+            'এই সাবস্ক্রিপশনটি আপনার তালিকা থেকে মুছে ফেলা হবে।'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('না'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _cancelSubscription(sub);
+            },
+            child: const Text('হ্যাঁ, বাতিল করুন',
+                style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle() {
+    return const Padding(
+      padding: EdgeInsets.fromLTRB(20, 20, 20, 8),
+      child: Row(
+        children: [
+          Text(
+            'একটিভ সাবস্ক্রিপশন',
+            style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 60),
+      child: Column(
+        children: [
+          Icon(Icons.receipt_long_rounded,
+              size: 60, color: Colors.grey.shade300),
+          const SizedBox(height: 12),
+          Text(
+            'এখনো কোনো সাবস্ক্রিপশন যোগ করা হয়নি',
+            style: TextStyle(color: Colors.grey.shade500),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSubscriptionTile(int index) {
+    final sub = _subscriptions[index];
+    final daysLeft = sub.renewalDate.difference(DateTime.now()).inDays;
+
+    return Dismissible(
+      key: ValueKey('${sub.name}_$index'),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.symmetric(horizontal: 20),
+        decoration: BoxDecoration(
+          color: Colors.red.shade400,
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: const Icon(Icons.delete_rounded, color: Colors.white),
+      ),
+      onDismissed: (_) => _deleteSubscription(index),
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 10,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 50,
+              height: 50,
+              decoration: BoxDecoration(
+                color: sub.color.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(sub.icon, color: sub.color, size: 26),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          sub.name,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 15, fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: sub.color.withOpacity(0.10),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          sub.billingCycle.label,
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: sub.color,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    daysLeft <= 3
+                        ? '⚠️ ${daysLeft} দিন পর রিনিউ (${_formatDate(sub.renewalDate)})'
+                        : 'রিনিউয়াল: ${_formatDate(sub.renewalDate)}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: daysLeft <= 3 ? Colors.red : Colors.grey,
+                      fontWeight:
+                          daysLeft <= 3 ? FontWeight.w600 : FontWeight.normal,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  '৳${sub.cost.toStringAsFixed(0)}',
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF6C5CE7),
+                  ),
+                ),
+                if (sub.billingCycle == BillingCycle.yearly)
+                  Text(
+                    '≈৳${sub.monthlyEquivalentCost.toStringAsFixed(0)}/মাস',
+                    style: const TextStyle(fontSize: 10, color: Colors.grey),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatDate(DateTime date) {
+    const months = [
+      'জানু',
+      'ফেব্রু',
+      'মার্চ',
+      'এপ্রিল',
+      'মে',
+      'জুন',
+      'জুলাই',
+      'আগস্ট',
+      'সেপ্টে',
+      'অক্টো',
+      'নভে',
+      'ডিসে'
+    ];
+    return '${date.day} ${months[date.month - 1]}';
+  }
+}
+
+// ---------------- ADD SUBSCRIPTION SHEET ----------------
+class AddSubscriptionSheet extends StatefulWidget {
+  final void Function(Subscription) onAdd;
+  const AddSubscriptionSheet({super.key, required this.onAdd});
+
+  @override
+  State<AddSubscriptionSheet> createState() => _AddSubscriptionSheetState();
+}
+
+class _AddSubscriptionSheetState extends State<AddSubscriptionSheet> {
+  final _nameController = TextEditingController();
+  final _costController = TextEditingController();
+  DateTime _selectedDate = DateTime.now().add(const Duration(days: 30));
+
+  final List<Map<String, dynamic>> _iconOptions = [
+    {'icon': Icons.smart_display_rounded, 'color': const Color(0xFFE50914)},
+    {'icon': Icons.music_note_rounded, 'color': const Color(0xFF1DB954)},
+    {'icon': Icons.wifi_rounded, 'color': const Color(0xFF0984E3)},
+    {'icon': Icons.fitness_center_rounded, 'color': const Color(0xFFE17055)},
+    {'icon': Icons.cloud_rounded, 'color': const Color(0xFF00B894)},
+    {'icon': Icons.games_rounded, 'color': const Color(0xFF6C5CE7)},
+  ];
+  int _selectedIconIndex = 0;
+  BillingCycle _billingCycle = BillingCycle.monthly;
+  DateTime _lastUsedDate = DateTime.now();
+
+  Future<void> _pickDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _selectedDate,
+      firstDate: DateTime.now(),
+      lastDate: DateTime(2030),
+      builder: (context, child) => Theme(
+        data: Theme.of(context).copyWith(
+          colorScheme: const ColorScheme.light(primary: Color(0xFF6C5CE7)),
+        ),
+        child: child!,
+      ),
+    );
+    if (picked != null) {
+      setState(() => _selectedDate = picked);
+    }
+  }
+
+  Future<void> _pickLastUsedDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _lastUsedDate,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      builder: (context, child) => Theme(
+        data: Theme.of(context).copyWith(
+          colorScheme: const ColorScheme.light(primary: Color(0xFF6C5CE7)),
+        ),
+        child: child!,
+      ),
+    );
+    if (picked != null) {
+      setState(() => _lastUsedDate = picked);
+    }
+  }
+
+  void _submit() {
+    final name = _nameController.text.trim();
+    final cost = double.tryParse(_costController.text.trim());
+    if (name.isEmpty || cost == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('সঠিক নাম ও খরচ দিন')),
+      );
+      return;
+    }
+    widget.onAdd(
+      Subscription(
+        name: name,
+        cost: cost,
+        renewalDate: _selectedDate,
+        icon: _iconOptions[_selectedIconIndex]['icon'],
+        color: _iconOptions[_selectedIconIndex]['color'],
+        billingCycle: _billingCycle,
+        lastUsedDate: _lastUsedDate,
+      ),
+    );
+    Navigator.pop(context);
+  }
+
+  Widget _cycleOption({
+    required String label,
+    required IconData icon,
+    required BillingCycle cycle,
+  }) {
+    final selected = _billingCycle == cycle;
+    return GestureDetector(
+      onTap: () => setState(() => _billingCycle = cycle),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          color:
+              selected ? const Color(0xFF6C5CE7).withOpacity(0.12) : Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(14),
+          border: selected
+              ? Border.all(color: const Color(0xFF6C5CE7), width: 1.5)
+              : null,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              size: 18,
+              color: selected ? const Color(0xFF6C5CE7) : Colors.grey,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? const Color(0xFF6C5CE7) : Colors.grey.shade700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        ),
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'নতুন সাবস্ক্রিপশন যোগ করুন',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 18),
+
+            // Icon picker
+            SizedBox(
+              height: 56,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: _iconOptions.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 10),
+                itemBuilder: (context, index) {
+                  final selected = _selectedIconIndex == index;
+                  final opt = _iconOptions[index];
+                  return GestureDetector(
+                    onTap: () => setState(() => _selectedIconIndex = index),
+                    child: Container(
+                      width: 50,
+                      height: 50,
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? opt['color'].withOpacity(0.15)
+                            : Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(14),
+                        border: selected
+                            ? Border.all(color: opt['color'], width: 2)
+                            : null,
+                      ),
+                      child: Icon(opt['icon'], color: opt['color']),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 18),
+
+            TextField(
+              controller: _nameController,
+              decoration: InputDecoration(
+                labelText: 'সাবস্ক্রিপশনের নাম',
+                hintText: 'যেমন: Netflix',
+                filled: true,
+                fillColor: Colors.grey.shade100,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: _costController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: 'মাসিক খরচ (৳)',
+                hintText: 'যেমন: 650',
+                filled: true,
+                fillColor: Colors.grey.shade100,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            const Text(
+              'বিলিং সাইকেল',
+              style: TextStyle(fontSize: 13, color: Colors.grey),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _cycleOption(
+                    label: 'মাসিক',
+                    icon: Icons.calendar_view_month_rounded,
+                    cycle: BillingCycle.monthly,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _cycleOption(
+                    label: 'বার্ষিক',
+                    icon: Icons.event_repeat_rounded,
+                    cycle: BillingCycle.yearly,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            InkWell(
+              onTap: _pickDate,
+              borderRadius: BorderRadius.circular(14),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.calendar_today_rounded,
+                        size: 18, color: Colors.grey),
+                    const SizedBox(width: 10),
+                    Text(
+                      'রিনিউয়াল ডেট: ${_selectedDate.day}-${_selectedDate.month}-${_selectedDate.year}',
+                      style: const TextStyle(fontSize: 14),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            InkWell(
+              onTap: _pickLastUsedDate,
+              borderRadius: BorderRadius.circular(14),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.history_rounded,
+                        size: 18, color: Colors.grey),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'সর্বশেষ ব্যবহার: ${_lastUsedDate.day}-${_lastUsedDate.month}-${_lastUsedDate.year}',
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 22),
+            SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: ElevatedButton(
+                onPressed: _submit,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF6C5CE7),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                child: const Text(
+                  'যোগ করুন',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
